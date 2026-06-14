@@ -1,0 +1,22 @@
+{
+  "configurations": [
+    {
+      "name": "esp-cam",
+      "includePath": [
+        "${config:idf.espIdfPath}/components/**",
+        "${workspaceFolder}/**"
+      ],
+      "browse": {
+      "path": [
+        "${config:idf.espIdfPath}/components/**",
+        "${workspaceFolder}/**"
+      ]
+      },
+      "defines": [],
+      "compileCommands": [
+        "${workspaceFolder}/build/compile_commands.json"
+      ]
+    }
+  ],
+  "version": 4
+}
