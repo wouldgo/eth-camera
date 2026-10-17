@@ -29,6 +29,6 @@ dependencies:
     version: 5.5.2
 direct_dependencies:
 - espressif/esp32-camera
-manifest_hash: d7e149ce482e09411afe997d2791bf93bd6981f6d0bebca81bac14b393a64c15
+manifest_hash: 833ec387a01a27ce27afd75e1ee116b653bb9717b8a57afaa66f1a80fe68ea2e
 target: esp32
 version: 2.0.0

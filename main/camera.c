@@ -24,6 +24,9 @@
 #define CAM_PIN_HREF 23
 #define CAM_PIN_PCLK 22
 
+#define CAPTURE_WARMUP_FRAMES 5 // frames discarded so exposure adapts to the flash
+#define CAPTURE_RETRIES 3
+
 static const char *TAG = "camera";
 static camera_config_t camera_config = {
   .pin_pwdn = CAM_PIN_PWDN,
@@ -50,7 +53,7 @@ static camera_config_t camera_config = {
   .ledc_channel = LEDC_CHANNEL_0,
 
   .pixel_format = PIXFORMAT_JPEG, //YUV422,GRAYSCALE,RGB565,JPEG
-  .frame_size = FRAMESIZE_FHD,    //QQVGA-UXGA, For ESP32, do not use sizes above QVGA when not JPEG. The performance of the ESP32-S series has improved a lot, but JPEG mode always gives better frame rates.
+  .frame_size = FRAMESIZE_UXGA,      //QQVGA-UXGA, For ESP32, do not use sizes above QVGA when not JPEG. The performance of the ESP32-S series has improved a lot, but JPEG mode always gives better frame rates.
 
   .jpeg_quality = 12,  //0-63, for OV series camera sensors, lower number means higher quality
   .fb_count = 1,       //When jpeg mode is used, if fb_count more than one, the driver will work in continuous mode.
@@ -75,16 +78,18 @@ esp_err_t configure_camera(void) {
 jpeg_image camera_capture() {
   jpeg_image img = { .fb = NULL };
 
-  // Drop stale frame
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (fb) {
+  // Drop stale frames and give auto-exposure time to adapt to the flash
+  for (int i = 0; i < CAPTURE_WARMUP_FRAMES; i++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      ESP_LOGE(TAG, "camera not responding");
+      return img;
+    }
     esp_camera_fb_return(fb);
   }
 
-  unsigned long start = 5;
-  while (!img.fb && start != 0) {
+  for (int i = 0; i < CAPTURE_RETRIES && !img.fb; i++) {
     img.fb = esp_camera_fb_get();
-    start--;
   }
 
   if (!img.fb) {

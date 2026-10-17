@@ -21,7 +21,10 @@
 *
 * GPI0 to GND and then reset to program
 * GPI1 and GPI3 to your TX, RX uart for programming
-* You need to disable power to the W5500 in order to program ESP32 (no idea why)
+* You need to disable power to the W5500 in order to program ESP32:
+* GPIO2 (CS) is pulled low at reset, so the W5500 is selected and drives MISO.
+* MISO is GPIO12, a strapping pin: if it is high at reset the ESP32 selects 1.8 V flash
+* and the 3.3 V flash can't be read or written.
 *
 * ESP32-CAM  -> W5500
 * GPIO14     -> SCLK
@@ -30,7 +33,7 @@
 * GPIO12     -> MISO
 * GND        -> GND
 *
-* I am powering both from same externam 5V source
+* ESP32-CAM 3V3 -> W5500 VCC (the W5500 needs 3.3 V, the ESP32 pins are not 5 V tolerant)
 *
 * Since GPIO2 is used for chip select this should not affect SD card operations
 * as SD card is also using HSPI spi interface
@@ -47,6 +50,7 @@
 static const char *TAG = "eth";
 static char hostname[32];
 static uint8_t device_mac_addr[6];
+static volatile uint8_t ip_last_octet = 0;
 
 static spi_bus_config_t buscfg = {
   .miso_io_num = PIN_MISO,
@@ -71,6 +75,9 @@ static void on_eth_event(void *arg, esp_event_base_t event_base, int32_t event_i
     ESP_LOGI(TAG, "Ethernet Link Up");
     break;
   case ETHERNET_EVENT_DISCONNECTED:
+    // IP_EVENT_ETH_LOST_IP only fires after CONFIG_ESP_NETIF_IP_LOST_TIMER_INTERVAL,
+    // so clear the IP as soon as the link goes down
+    ip_last_octet = 0;
     ESP_LOGI(TAG, "Ethernet Link Down");
     break;
   case ETHERNET_EVENT_START:
@@ -88,6 +95,7 @@ static void on_ip_event(void *arg, esp_event_base_t event_base, int32_t event_id
   if (event_id == IP_EVENT_ETH_GOT_IP) {
     ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
     const esp_netif_ip_info_t *ip_info = &event->ip_info;
+    ip_last_octet = esp_ip4_addr4(&ip_info->ip);
 
     ESP_LOGI(TAG, "Ethernet Got IP Address");
     ESP_LOGI(TAG, "~~~~~~~~~~~");
@@ -97,8 +105,13 @@ static void on_ip_event(void *arg, esp_event_base_t event_base, int32_t event_id
     ESP_LOGI(TAG, "GW: " IPSTR, IP2STR(&ip_info->gw));
     ESP_LOGI(TAG, "~~~~~~~~~~~");
   } else if (event_id == IP_EVENT_ETH_LOST_IP) {
+    ip_last_octet = 0;
     ESP_LOGW(TAG, "Ethernet Lost IP Address");
   }
+}
+
+uint8_t net_ip_last_octet(void) {
+  return ip_last_octet;
 }
 
 static esp_err_t generate_laa_mac(uint8_t mac[6]) {
@@ -130,9 +143,9 @@ static esp_err_t generate_hostname(uint8_t mac_addr[6], char *hostname, size_t l
 
 esp_err_t net_init() {
 #if !CONFIG_ETH_SPI_ETHERNET_W5500
-  ESP_LOGE(TAG, "net with w5500 is not configured in this firmware")
+  ESP_LOGE(TAG, "net with w5500 is not configured in this firmware");
   return ESP_ERR_INVALID_STATE;
-#endif
+#else
   ESP_ERROR_CHECK(esp_netif_init());
   esp_err_t err = esp_event_loop_create_default();
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -148,7 +161,7 @@ esp_err_t net_init() {
   ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_LOST_IP, &on_ip_event, NULL));
 
   eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
-  mac_config.sw_reset_timeout_ms = 10;
+  mac_config.sw_reset_timeout_ms = 100;
 
   eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
   phy_config.autonego_timeout_ms = 0;
@@ -157,7 +170,6 @@ esp_err_t net_init() {
   esp_err_t ret = spi_bus_initialize(ETH_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
   if (ret == ESP_ERR_INVALID_STATE) {
     ESP_LOGW(TAG, "SPI bus already initialized");
-    ESP_ERROR_CHECK(ret);
   } else {
     ESP_ERROR_CHECK(ret);
   }
@@ -165,7 +177,7 @@ esp_err_t net_init() {
   eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(ETH_SPI_HOST, &devcfg);
   w5500_config.int_gpio_num = PIN_INT;
   if (w5500_config.int_gpio_num == -1) {
-    w5500_config.poll_period_ms = 300;
+    w5500_config.poll_period_ms = 10;
   }
 
   esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
@@ -195,4 +207,5 @@ esp_err_t net_init() {
   ESP_ERROR_CHECK(esp_eth_start(eth_handle));
 
   return ESP_OK;
+#endif
 }

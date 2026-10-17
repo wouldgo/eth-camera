@@ -14,4 +14,6 @@ idf_component_register(
     esp_event
     nvs_flash
     esp_psram
+    esp_timer
+    esp_driver_ledc
 )

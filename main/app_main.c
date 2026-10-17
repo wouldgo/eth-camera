@@ -48,13 +48,12 @@ void app_main(void) {
 
   ESP_ERROR_CHECK(start_webserver());
   ESP_LOGI(TAG, "camera boot ended correctly");
-  char buffer[100];
-  uint32_t passed_time = 0;
+  char buffer[16];
   while(true) {
-    passed_time = xTaskGetTickCount() % 10;
-    sprintf(buffer, "%lu", passed_time);
+    uint8_t ip_octet = net_ip_last_octet();
+    snprintf(buffer, sizeof(buffer), "%u", ip_octet);
     enqueue_message(buffer);
-    ESP_LOGI(TAG, "alive: %lu", passed_time);
+    ESP_LOGI(TAG, "alive: ip .%u", ip_octet);
     vTaskDelay(pdMS_TO_TICKS(30 * 1000));
   }
 }

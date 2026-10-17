@@ -1,48 +1,73 @@
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
 #include <esp_log.h>
+#include <esp_timer.h>
+#include <stdlib.h>
 
 #include "http.h"
 #include "camera.h"
 #include "leds.h"
 
-#ifndef MIN
-#define MIN(a,b) (((a)<(b))?(a):(b))
-#endif
-
 #define TCP_PORT 3000
+#define SNAPSHOT_MIN_INTERVAL_US (3 * 1000 * 1000) // min time between two snapshots
 
-static const size_t http_max_response_chunk_size = 560;
-static SemaphoreHandle_t camera_mutex = NULL;
 static const char *TAG = "http";
 
 static httpd_handle_t server = NULL;
+static int64_t last_snapshot_us = 0;
 
+// Reads ?flash=0..100 (flash duty %). Missing key -> FLASH_DEFAULT_DUTY_PCT.
+static esp_err_t parse_flash_duty(httpd_req_t *req, uint8_t *duty) {
+  *duty = FLASH_DEFAULT_DUTY_PCT;
+
+  char query[32];
+  char value[8];
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+      httpd_query_key_value(query, "flash", value, sizeof(value)) != ESP_OK) {
+    return ESP_OK;
+  }
+
+  char *end = NULL;
+  long parsed = strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 0 || parsed > 100) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  *duty = (uint8_t)parsed;
+  return ESP_OK;
+}
+
+// esp_http_server handles one request at a time, so concurrent clients are queued
 static esp_err_t snapshot_handler(httpd_req_t *req) {
-#if !ESP_CAMERA_SUPPORTED && !CONFIG_ETH_SPI_ETHERNET_W5500
+#if !ESP_CAMERA_SUPPORTED || !CONFIG_ETH_SPI_ETHERNET_W5500
   ESP_LOGW(TAG, "not supposed to work!");
   return ESP_ERR_INVALID_STATE;
 #else
   esp_err_t res = ESP_OK;
   jpeg_image img = {0};
-  bool response_started = false;
 
-  if (xSemaphoreTake(camera_mutex, 0) != pdTRUE) {
-    ESP_LOGW(TAG, "request rejected: already in use");
+  uint8_t flash_duty;
+  if (parse_flash_duty(req, &flash_duty) != ESP_OK) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, "flash must be an integer 0..100", HTTPD_RESP_USE_STRLEN);
+  }
 
-    httpd_resp_set_status(req, "503 Service Unavailable");
+  int64_t now = esp_timer_get_time();
+  if (last_snapshot_us != 0 && now - last_snapshot_us < SNAPSHOT_MIN_INTERVAL_US) {
+    ESP_LOGW(TAG, "request rejected: rate limited");
+
+    httpd_resp_set_status(req, "429 Too Many Requests");
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_set_hdr(req, "Retry-After", "3");
     httpd_resp_set_hdr(req, "Connection", "close");
 
-    return httpd_resp_send(req, "already in use", HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(req, "too many requests", HTTPD_RESP_USE_STRLEN);
   }
+  last_snapshot_us = now;
 
-  ESP_LOGI(TAG, "taking picture...");
-  set_flash_led(true);
+  ESP_LOGI(TAG, "taking picture... (flash %u%%)", flash_duty);
+  set_flash_duty(flash_duty);
   img = camera_capture();
-
   set_flash_led(false);
+
   if (!img.fb || !img.fb->buf || img.fb->len == 0) {
     ESP_LOGE(TAG, "capture failed");
 
@@ -58,49 +83,18 @@ static esp_err_t snapshot_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Connection", "close");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
-  size_t bytes_remaining = img.fb->len;
-  size_t offset = 0;
-  ESP_LOGD(TAG, "bytes_remaining: %zu", bytes_remaining);
-  ESP_LOGD(TAG, "offset: %zu", offset);
-  while (bytes_remaining > 0) {
-    ESP_LOGD(TAG, "=============");
-    if (httpd_req_to_sockfd(req) < 0) {
-      ESP_LOGI(TAG, "client disconnected");
-      break;
-    }
-
-    size_t chunk_size = MIN(bytes_remaining, http_max_response_chunk_size);
-    res = httpd_resp_send_chunk(req,
-          (const char *)&img.fb->buf[offset], chunk_size);
-
-    if (res != ESP_OK) {
-      ESP_LOGE(TAG, "send failed");
-      break;
-    }
-
-    if (!response_started) {
-      response_started = true;
-    }
-    offset += chunk_size;
-    bytes_remaining -= chunk_size;
-    ESP_LOGD(TAG, "chunk_size: %zu", chunk_size);
-    ESP_LOGD(TAG, "offset: %zu", offset);
-    ESP_LOGD(TAG, "bytes_remaining: %zu", bytes_remaining);
-  }
-
-  if (response_started) {
-    httpd_resp_send_chunk(req, NULL, 0);
+  res = httpd_resp_send(req, (const char *)img.fb->buf, img.fb->len);
+  if (res != ESP_OK) {
+    ESP_LOGE(TAG, "send failed: %s", esp_err_to_name(res));
+  } else {
     ESP_LOGI(TAG, "photo sent");
   }
 
   cleanup:
   if (img.fb) {
-    res = camera_release(&img);
-    img.fb = NULL;
+    camera_release(&img);
+    ESP_LOGI(TAG, "camera released");
   }
-
-  xSemaphoreGive(camera_mutex);
-  ESP_LOGI(TAG, "camera released");
 
   return res;
 #endif
@@ -143,79 +137,12 @@ esp_err_t start_webserver(void) {
     return ret;
   }
 
-  camera_mutex = xSemaphoreCreateMutex();
-
-  register_routes();
+  ret = register_routes();
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "register routes failed");
+    httpd_stop(server);
+    server = NULL;
+    return ret;
+  }
   return ESP_OK;
 }
-
-
-// #define TCP_PORT 3000        // Port your server will listen on
-// #define TCP_BACKLOG 5        // Max pending connections
-
-// static void tcp_server_task(void *pvParameters) {
-//   int listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-//   if (listen_sock < 0) {
-//     ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-//     vTaskDelete(NULL);
-//     return;
-//   }
-
-//   struct sockaddr_in server_addr;
-//   server_addr.sin_family = AF_INET;
-//   server_addr.sin_port = htons(TCP_PORT);
-//   server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-//   int err = bind(listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
-//   if (err < 0) {
-//     ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
-//     close(listen_sock);
-//     vTaskDelete(NULL);
-//     return;
-//   }
-
-//   err = listen(listen_sock, TCP_BACKLOG);
-//   if (err < 0) {
-//     ESP_LOGE(TAG, "Error occurred during listen: errno %d", errno);
-//     close(listen_sock);
-//     vTaskDelete(NULL);
-//     return;
-//   }
-
-//   ESP_LOGI(TAG, "TCP server listening on port %d", TCP_PORT);
-
-//   while (1) {
-//     struct sockaddr_in client_addr;
-//     socklen_t client_addr_len = sizeof(client_addr);
-//     int client_sock = accept(listen_sock, (struct sockaddr *)&client_addr, &client_addr_len);
-//     if (client_sock < 0) {
-//       ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
-//       continue;
-//     }
-
-//     ESP_LOGI(TAG, "Client connected");
-
-//     char rx_buffer[128];
-//     int len;
-//     while ((len = recv(client_sock, rx_buffer, sizeof(rx_buffer) - 1, 0)) > 0) {
-//       rx_buffer[len] = 0; // null-terminate string
-//       ESP_LOGI(TAG, "Received %d bytes: %s", len, rx_buffer);
-
-//       // Echo back to client
-//       send(client_sock, rx_buffer, len, 0);
-//     }
-
-//     if (len == 0) {
-//       ESP_LOGI(TAG, "Connection closed");
-//     } else if (len < 0) {
-//       ESP_LOGE(TAG, "recv failed: errno %d", errno);
-//     }
-
-//     close(client_sock);
-//   }
-
-//   close(listen_sock);
-//   vTaskDelete(NULL);
-// }
-
-//xTaskCreate(tcp_server_task, "tcp_server", 4096, NULL, 5, NULL);
